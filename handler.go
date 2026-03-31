@@ -109,20 +109,42 @@ func (o Option) NewHandler() *Handler {
 }
 
 // Handler is an slog.Handler that sends log records as CloudEvents to the getalert API.
+//
+// A record is sent when its level meets the configured threshold OR when
+// it (or the logger) carries the attribute "send" set to true.
+// The "send" attribute is stripped from the CloudEvent data.
 type Handler struct {
-	opt    Option
-	attrs  []slog.Attr
-	groups []string
-	ch     chan cloudEvent
-	done   chan struct{}
-	once   sync.Once
+	opt     Option
+	attrs   []slog.Attr
+	groups  []string
+	hasSend bool // true when With("send", true) was called on this handler
+	ch      chan cloudEvent
+	done    chan struct{}
+	once    sync.Once
 }
 
-func (h *Handler) Enabled(_ context.Context, level slog.Level) bool {
-	return level >= h.opt.Level.Level()
+const sendAttrKey = "send"
+
+func (h *Handler) Enabled(_ context.Context, _ slog.Level) bool {
+	// Always return true so Handle() can inspect per-record "send" attribute.
+	return true
 }
 
 func (h *Handler) Handle(_ context.Context, record slog.Record) error {
+	send := h.hasSend || record.Level >= h.opt.Level.Level()
+	if !send {
+		record.Attrs(func(a slog.Attr) bool {
+			if a.Key == sendAttrKey && a.Value.Kind() == slog.KindBool && a.Value.Bool() {
+				send = true
+				return false
+			}
+			return true
+		})
+	}
+	if !send {
+		return nil
+	}
+
 	ce := h.buildEvent(record)
 
 	select {
@@ -134,12 +156,19 @@ func (h *Handler) Handle(_ context.Context, record slog.Record) error {
 }
 
 func (h *Handler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	hasSend := h.hasSend
+	for _, a := range attrs {
+		if a.Key == sendAttrKey && a.Value.Kind() == slog.KindBool {
+			hasSend = a.Value.Bool()
+		}
+	}
 	return &Handler{
-		opt:    h.opt,
-		attrs:  append(cloneAttrs(h.attrs), attrs...),
-		groups: h.groups,
-		ch:     h.ch,
-		done:   h.done,
+		opt:     h.opt,
+		attrs:   append(cloneAttrs(h.attrs), attrs...),
+		groups:  h.groups,
+		hasSend: hasSend,
+		ch:      h.ch,
+		done:    h.done,
 	}
 }
 
@@ -148,11 +177,12 @@ func (h *Handler) WithGroup(name string) slog.Handler {
 		return h
 	}
 	return &Handler{
-		opt:    h.opt,
-		attrs:  cloneAttrs(h.attrs),
-		groups: append(cloneStrings(h.groups), name),
-		ch:     h.ch,
-		done:   h.done,
+		opt:     h.opt,
+		attrs:   cloneAttrs(h.attrs),
+		groups:  append(cloneStrings(h.groups), name),
+		hasSend: h.hasSend,
+		ch:      h.ch,
+		done:    h.done,
 	}
 }
 
@@ -262,6 +292,10 @@ func mapSeverity(level slog.Level) string {
 func collectAttr(data map[string]any, prefix string, a slog.Attr) {
 	a.Value = a.Value.Resolve()
 	if a.Equal(slog.Attr{}) {
+		return
+	}
+
+	if prefix == "" && a.Key == sendAttrKey {
 		return
 	}
 

@@ -1,6 +1,7 @@
 package sloggetalert
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -11,21 +12,15 @@ import (
 	"time"
 )
 
-func TestEnabled(t *testing.T) {
+func TestEnabledAlwaysTrue(t *testing.T) {
 	h := Option{Level: slog.LevelWarn}.NewHandler()
 	defer h.Close()
 
-	if h.Enabled(nil, slog.LevelDebug) {
-		t.Error("should not be enabled for debug")
-	}
-	if h.Enabled(nil, slog.LevelInfo) {
-		t.Error("should not be enabled for info")
-	}
-	if !h.Enabled(nil, slog.LevelWarn) {
-		t.Error("should be enabled for warn")
-	}
-	if !h.Enabled(nil, slog.LevelError) {
-		t.Error("should be enabled for error")
+	// Enabled returns true for all levels so Handle() can inspect per-record "send" attr.
+	for _, level := range []slog.Level{slog.LevelDebug, slog.LevelInfo, slog.LevelWarn, slog.LevelError} {
+		if !h.Enabled(context.Background(), level) {
+			t.Errorf("Enabled should return true for %v", level)
+		}
 	}
 }
 
@@ -468,5 +463,100 @@ func TestEnvironmentOption(t *testing.T) {
 
 	if received.Environment != "staging" {
 		t.Errorf("environment = %q, want staging", received.Environment)
+	}
+}
+
+func TestSendAttrPerRecord(t *testing.T) {
+	var mu sync.Mutex
+	var received []cloudEvent
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var ce cloudEvent
+		json.Unmarshal(body, &ce)
+		mu.Lock()
+		received = append(received, ce)
+		mu.Unlock()
+		json.NewEncoder(w).Encode(map[string]any{"ok": true})
+	}))
+	defer srv.Close()
+
+	h := Option{
+		Level:    slog.LevelWarn,
+		Endpoint: srv.URL + "/v1/events",
+		APIKey:   "test-key",
+		Source:   "//test",
+		Type:     "log.record",
+	}.NewHandler()
+
+	log := slog.New(h)
+	log.Info("not sent")
+	log.Info("sent via attr", "send", true, "key", "val")
+
+	time.Sleep(200 * time.Millisecond)
+	h.Close()
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if len(received) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(received))
+	}
+	if title, _ := received[0].Data["title"]; title != "sent via attr" {
+		t.Errorf("data.title = %v, want 'sent via attr'", title)
+	}
+	if _, ok := received[0].Data["send"]; ok {
+		t.Error("send attr should be stripped from data")
+	}
+	if v, ok := received[0].Data["key"]; !ok || v != "val" {
+		t.Errorf("data.key = %v, want 'val'", v)
+	}
+}
+
+func TestSendAttrViaWith(t *testing.T) {
+	var mu sync.Mutex
+	var received []cloudEvent
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var ce cloudEvent
+		json.Unmarshal(body, &ce)
+		mu.Lock()
+		received = append(received, ce)
+		mu.Unlock()
+		json.NewEncoder(w).Encode(map[string]any{"ok": true})
+	}))
+	defer srv.Close()
+
+	h := Option{
+		Level:    slog.LevelWarn,
+		Endpoint: srv.URL + "/v1/events",
+		APIKey:   "test-key",
+		Source:   "//test",
+		Type:     "log.record",
+	}.NewHandler()
+
+	// logger with send=true sends all levels
+	alertLog := slog.New(h).With("send", true)
+	alertLog.Info("important info")
+
+	// logger without send=true respects level
+	normalLog := slog.New(h)
+	normalLog.Info("ignored info")
+
+	time.Sleep(200 * time.Millisecond)
+	h.Close()
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if len(received) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(received))
+	}
+	if title, _ := received[0].Data["title"]; title != "important info" {
+		t.Errorf("data.title = %v, want 'important info'", title)
+	}
+	if _, ok := received[0].Data["send"]; ok {
+		t.Error("send attr should be stripped from data")
 	}
 }
