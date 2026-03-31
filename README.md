@@ -6,6 +6,7 @@ Go [slog](https://pkg.go.dev/log/slog) handler that sends log records to [getale
 
 - **CloudEvents 1.0** — each log record is sent as a CloudEvent with structured `data`
 - **Async** — non-blocking `Handle()`, background worker sends via HTTP
+- **`send` attribute** — force-send any record regardless of level via `"send", true`
 - **Retry with backoff** — retries on 5xx / timeout with exponential delay
 - **Graceful shutdown** — `Close()` flushes pending events before exit
 - **slog-compatible** — implements `slog.Handler`, works with `slog-multi.Fanout`
@@ -73,6 +74,22 @@ log := slog.New(handler)
 log.Error("database unreachable")
 ```
 
+### Force-send with `send` attribute
+
+By default only records at `Level` or above are sent. Add `"send", true` to force-send any record regardless of level:
+
+```go
+// per-record: send a single Info record
+log.Info("user registered", "send", true, "user_id", 123)
+
+// via With: every record from this logger is sent
+alertLog := log.With("send", true)
+alertLog.Info("important info")   // → sent
+alertLog.Debug("debug details")   // → sent
+```
+
+The `send` attribute is stripped from the CloudEvent data — it is a control flag only.
+
 ## Configuration
 
 | Option | Default | Description |
@@ -125,10 +142,12 @@ Each slog record produces a CloudEvent:
 slog.Warn("msg") → Handle() → channel → worker goroutine → POST JSON → getalert API
 ```
 
-1. `Handle()` builds a CloudEvent from the log record and pushes it into a buffered channel (non-blocking)
-2. A background goroutine reads events and sends each as `POST` with JSON body
-3. On 5xx or timeout, retries with exponential backoff
-4. `Close()` drains the channel and flushes remaining events
+1. `Enabled()` always returns `true` so `Handle()` can inspect per-record `send` attribute
+2. `Handle()` checks: level >= threshold **OR** `send: true` present — otherwise skips
+3. Builds a CloudEvent and pushes it into a buffered channel (non-blocking)
+4. A background goroutine reads events and sends each as `POST` with JSON body
+5. On 5xx or timeout, retries with exponential backoff
+6. `Close()` drains the channel and flushes remaining events
 
 ## License
 
