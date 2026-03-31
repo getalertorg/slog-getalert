@@ -14,12 +14,12 @@ func Example() {
 	}
 
 	alertHandler := sloggetalert.Option{
-		Level:      slog.LevelWarn,
-		Endpoint:   "https://api.getalert.ru",
-		APIKey:     os.Getenv("GETALERT_API_KEY"),
-		Project:    "myproject",
-		Topic:      "logs",
-		DynamicTag: true,
+		Level:       slog.LevelWarn,
+		Endpoint:    "https://api.getalert.ru/v1/events",
+		APIKey:      os.Getenv("GETALERT_API_KEY"),
+		Source:      "//my-service",
+		Type:        "log.record",
+		Environment: "production",
 	}.NewHandler()
 	defer alertHandler.Close()
 

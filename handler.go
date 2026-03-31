@@ -3,6 +3,7 @@ package sloggetalert
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -10,15 +11,15 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 const (
-	defaultBufferSize    = 256
-	defaultBatchSize     = 10
-	defaultBatchInterval = 2 * time.Second
-	defaultTimeout       = 5 * time.Second
-	defaultMaxRetries    = 2
-	defaultRetryDelay    = 500 * time.Millisecond
+	defaultBufferSize = 256
+	defaultTimeout    = 5 * time.Second
+	defaultMaxRetries = 2
+	defaultRetryDelay = 500 * time.Millisecond
 )
 
 // Option configures a getalert slog handler.
@@ -32,27 +33,17 @@ type Option struct {
 	// APIKey is the Bearer token for authentication.
 	APIKey string
 
-	// Project is the project code in getalert.
-	Project string
+	// Source is the CloudEvent source (e.g. "//my-service").
+	Source string
 
-	// Topic is the topic code in getalert.
-	Topic string
+	// Type is the CloudEvent type (e.g. "log.record").
+	Type string
 
-	// Tag is a static tag value. If DynamicTag is true, the log level is used instead.
-	Tag string
-
-	// DynamicTag sends ?tag=warn or ?tag=error based on the log level.
-	// Takes precedence over Tag.
-	DynamicTag bool
+	// Environment is the CloudEvent environment. Defaults to "production".
+	Environment string
 
 	// BufferSize is the channel buffer size. Defaults to 256.
 	BufferSize int
-
-	// BatchSize is the max number of messages per batch. Defaults to 10.
-	BatchSize int
-
-	// BatchInterval is the max time to wait before flushing a batch. Defaults to 2s.
-	BatchInterval time.Duration
 
 	// Timeout is the HTTP request timeout. Defaults to 5s.
 	Timeout time.Duration
@@ -63,22 +54,19 @@ type Option struct {
 	// RetryDelay is the base delay between retries (doubled each attempt). Defaults to 500ms.
 	RetryDelay time.Duration
 
-	// Source includes the caller source location in the message.
-	Source bool
+	// AddSource includes the caller source location in the event data.
+	AddSource bool
 }
 
 func (o Option) withDefaults() Option {
 	if o.Level == nil {
 		o.Level = slog.LevelWarn
 	}
+	if o.Environment == "" {
+		o.Environment = "production"
+	}
 	if o.BufferSize <= 0 {
 		o.BufferSize = defaultBufferSize
-	}
-	if o.BatchSize <= 0 {
-		o.BatchSize = defaultBatchSize
-	}
-	if o.BatchInterval <= 0 {
-		o.BatchInterval = defaultBatchInterval
 	}
 	if o.Timeout <= 0 {
 		o.Timeout = defaultTimeout
@@ -95,25 +83,37 @@ func (o Option) withDefaults() Option {
 	return o
 }
 
-// NewHandler creates a new getalert slog handler.
+type cloudEvent struct {
+	SpecVersion     string         `json:"specversion"`
+	ID              string         `json:"id"`
+	Source          string         `json:"source"`
+	Type            string         `json:"type"`
+	Time            time.Time      `json:"time"`
+	DataContentType string         `json:"datacontenttype"`
+	Severity        string         `json:"severity"`
+	Environment     string         `json:"environment"`
+	Data            map[string]any `json:"data"`
+}
+
+// NewHandler creates a new getalert slog handler that sends CloudEvents.
 func (o Option) NewHandler() *Handler {
 	o = o.withDefaults()
 
 	h := &Handler{
 		opt:  o,
-		ch:   make(chan string, o.BufferSize),
+		ch:   make(chan cloudEvent, o.BufferSize),
 		done: make(chan struct{}),
 	}
 	go h.worker()
 	return h
 }
 
-// Handler is an slog.Handler that sends log records to getalert API.
+// Handler is an slog.Handler that sends log records as CloudEvents to the getalert API.
 type Handler struct {
 	opt    Option
 	attrs  []slog.Attr
 	groups []string
-	ch     chan string
+	ch     chan cloudEvent
 	done   chan struct{}
 	once   sync.Once
 }
@@ -123,10 +123,10 @@ func (h *Handler) Enabled(_ context.Context, level slog.Level) bool {
 }
 
 func (h *Handler) Handle(_ context.Context, record slog.Record) error {
-	msg := h.format(record)
+	ce := h.buildEvent(record)
 
 	select {
-	case h.ch <- msg:
+	case h.ch <- ce:
 	default:
 		// buffer full — drop to avoid blocking the application
 	}
@@ -156,8 +156,7 @@ func (h *Handler) WithGroup(name string) slog.Handler {
 	}
 }
 
-// Close flushes pending messages and stops the background worker.
-// It blocks until all buffered messages are sent or the context is cancelled.
+// Close flushes pending events and stops the background worker.
 func (h *Handler) Close() {
 	h.once.Do(func() {
 		close(h.ch)
@@ -165,90 +164,58 @@ func (h *Handler) Close() {
 	})
 }
 
-func (h *Handler) format(record slog.Record) string {
-	var b strings.Builder
+func (h *Handler) buildEvent(record slog.Record) cloudEvent {
+	data := make(map[string]any)
+	data["title"] = record.Message
 
-	b.WriteString(fmt.Sprintf("[%s] %s", record.Level, record.Message))
-
-	if h.opt.Source {
-		// slog doesn't expose source by default in Handle; we skip the runtime.Callers
-		// approach for simplicity. Use record's PC if available.
-		if record.PC != 0 {
-			f := runtimeFrame(record.PC)
-			if f.File != "" {
-				b.WriteString(fmt.Sprintf("\n  source: %s:%d", f.File, f.Line))
-			}
+	if h.opt.AddSource && record.PC != 0 {
+		f := runtimeFrame(record.PC)
+		if f.File != "" {
+			data["source_location"] = fmt.Sprintf("%s:%d", f.File, f.Line)
 		}
 	}
 
 	prefix := groupPrefix(h.groups)
 
 	for _, a := range h.attrs {
-		writeAttr(&b, prefix, a)
+		collectAttr(data, prefix, a)
 	}
 
 	record.Attrs(func(a slog.Attr) bool {
-		writeAttr(&b, prefix, a)
+		collectAttr(data, prefix, a)
 		return true
 	})
 
-	return b.String()
+	return cloudEvent{
+		SpecVersion:     "1.0",
+		ID:              uuid.New().String(),
+		Source:          h.opt.Source,
+		Type:            h.opt.Type,
+		Time:            record.Time,
+		DataContentType: "application/json",
+		Severity:        mapSeverity(record.Level),
+		Environment:     h.opt.Environment,
+		Data:            data,
+	}
 }
 
 func (h *Handler) worker() {
 	defer close(h.done)
 
 	client := &http.Client{Timeout: h.opt.Timeout}
-	batch := make([]string, 0, h.opt.BatchSize)
-	timer := time.NewTimer(h.opt.BatchInterval)
-	defer timer.Stop()
 
-	flush := func() {
-		if len(batch) == 0 {
-			return
-		}
-		body := strings.Join(batch, "\n\n---\n\n")
-		tag := h.resolveTag(batch)
-		h.send(client, body, tag)
-		batch = batch[:0]
-	}
-
-	for {
-		select {
-		case msg, ok := <-h.ch:
-			if !ok {
-				flush()
-				return
-			}
-			batch = append(batch, msg)
-			if len(batch) >= h.opt.BatchSize {
-				flush()
-				timer.Reset(h.opt.BatchInterval)
-			}
-		case <-timer.C:
-			flush()
-			timer.Reset(h.opt.BatchInterval)
-		}
+	for ce := range h.ch {
+		h.send(client, ce)
 	}
 }
 
-func (h *Handler) resolveTag(batch []string) string {
-	if !h.opt.DynamicTag {
-		return h.opt.Tag
+func (h *Handler) send(client *http.Client, ce cloudEvent) {
+	body, err := json.Marshal(ce)
+	if err != nil {
+		return
 	}
-	for _, msg := range batch {
-		if strings.HasPrefix(msg, "[ERROR]") {
-			return "error"
-		}
-	}
-	return "warn"
-}
 
-func (h *Handler) send(client *http.Client, body string, tag string) {
-	url := fmt.Sprintf("%s/%s/%s", h.opt.Endpoint, h.opt.Project, h.opt.Topic)
-	if tag != "" {
-		url += "?tag=" + tag
-	}
+	url := h.opt.Endpoint
 
 	var lastErr error
 	for attempt := range h.opt.MaxRetries {
@@ -257,12 +224,12 @@ func (h *Handler) send(client *http.Client, body string, tag string) {
 			time.Sleep(delay)
 		}
 
-		req, err := http.NewRequest(http.MethodPut, url, bytes.NewBufferString(body))
+		req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
 		if err != nil {
 			return
 		}
 		req.Header.Set("Authorization", "Bearer "+h.opt.APIKey)
-		req.Header.Set("Content-Type", "text/plain; charset=utf-8")
+		req.Header.Set("Content-Type", "application/json")
 
 		resp, err := client.Do(req)
 		if err != nil {
@@ -281,14 +248,18 @@ func (h *Handler) send(client *http.Client, body string, tag string) {
 	_ = lastErr
 }
 
-func groupPrefix(groups []string) string {
-	if len(groups) == 0 {
-		return ""
+func mapSeverity(level slog.Level) string {
+	switch {
+	case level >= slog.LevelError:
+		return "error"
+	case level >= slog.LevelWarn:
+		return "warning"
+	default:
+		return "info"
 	}
-	return strings.Join(groups, ".") + "."
 }
 
-func writeAttr(b *strings.Builder, prefix string, a slog.Attr) {
+func collectAttr(data map[string]any, prefix string, a slog.Attr) {
 	a.Value = a.Value.Resolve()
 	if a.Equal(slog.Attr{}) {
 		return
@@ -301,12 +272,41 @@ func writeAttr(b *strings.Builder, prefix string, a slog.Attr) {
 			newPrefix = prefix + a.Key + "."
 		}
 		for _, ga := range groupAttrs {
-			writeAttr(b, newPrefix, ga)
+			collectAttr(data, newPrefix, ga)
 		}
 		return
 	}
 
-	b.WriteString(fmt.Sprintf("\n  %s%s: %s", prefix, a.Key, a.Value.String()))
+	key := prefix + a.Key
+	data[key] = resolveValue(a.Value)
+}
+
+func resolveValue(v slog.Value) any {
+	switch v.Kind() {
+	case slog.KindString:
+		return v.String()
+	case slog.KindInt64:
+		return v.Int64()
+	case slog.KindUint64:
+		return v.Uint64()
+	case slog.KindFloat64:
+		return v.Float64()
+	case slog.KindBool:
+		return v.Bool()
+	case slog.KindDuration:
+		return v.Duration().String()
+	case slog.KindTime:
+		return v.Time().Format(time.RFC3339Nano)
+	default:
+		return v.String()
+	}
+}
+
+func groupPrefix(groups []string) string {
+	if len(groups) == 0 {
+		return ""
+	}
+	return strings.Join(groups, ".") + "."
 }
 
 func cloneAttrs(attrs []slog.Attr) []slog.Attr {
