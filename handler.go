@@ -36,7 +36,7 @@ type Option struct {
 	// Source is the CloudEvent source (e.g. "//my-service").
 	Source string
 
-	// Type is the CloudEvent type (e.g. "log.record").
+	// Type is the CloudEvent type. Defaults to "log".
 	Type string
 
 	// Environment is the CloudEvent environment. Defaults to "production".
@@ -56,11 +56,17 @@ type Option struct {
 
 	// AddSource includes the caller source location in the event data.
 	AddSource bool
+
+	// AddEmoji prepends a severity emoji to the subject (⚠️ warning, 🔴 error, ℹ️ info).
+	AddEmoji bool
 }
 
 func (o Option) withDefaults() Option {
 	if o.Level == nil {
 		o.Level = slog.LevelWarn
+	}
+	if o.Type == "" {
+		o.Type = "log"
 	}
 	if o.Environment == "" {
 		o.Environment = "production"
@@ -88,6 +94,7 @@ type cloudEvent struct {
 	ID              string         `json:"id"`
 	Source          string         `json:"source"`
 	Type            string         `json:"type"`
+	Subject         string         `json:"subject"`
 	Time            time.Time      `json:"time"`
 	DataContentType string         `json:"datacontenttype"`
 	Severity        string         `json:"severity"`
@@ -196,7 +203,6 @@ func (h *Handler) Close() {
 
 func (h *Handler) buildEvent(record slog.Record) cloudEvent {
 	data := make(map[string]any)
-	data["title"] = record.Message
 
 	if h.opt.AddSource && record.PC != 0 {
 		f := runtimeFrame(record.PC)
@@ -216,14 +222,21 @@ func (h *Handler) buildEvent(record slog.Record) cloudEvent {
 		return true
 	})
 
+	severity := mapSeverity(record.Level)
+	subject := record.Message
+	if h.opt.AddEmoji {
+		subject = severityEmoji(severity) + " " + subject
+	}
+
 	return cloudEvent{
 		SpecVersion:     "1.0",
 		ID:              uuid.New().String(),
 		Source:          h.opt.Source,
 		Type:            h.opt.Type,
+		Subject:         subject,
 		Time:            record.Time,
 		DataContentType: "application/json",
-		Severity:        mapSeverity(record.Level),
+		Severity:        severity,
 		Environment:     h.opt.Environment,
 		Data:            data,
 	}
@@ -286,6 +299,17 @@ func mapSeverity(level slog.Level) string {
 		return "warning"
 	default:
 		return "info"
+	}
+}
+
+func severityEmoji(severity string) string {
+	switch severity {
+	case "error":
+		return "🔴"
+	case "warning":
+		return "⚠️"
+	default:
+		return "ℹ️"
 	}
 }
 

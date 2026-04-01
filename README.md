@@ -4,7 +4,7 @@ Go [slog](https://pkg.go.dev/log/slog) handler that sends log records to [getale
 
 ## Features
 
-- **CloudEvents 1.0** — each log record is sent as a CloudEvent with structured `data`
+- **CloudEvents 1.0** — each log record is sent as a CloudEvent with `subject` and structured `data`
 - **Async** — non-blocking `Handle()`, background worker sends via HTTP
 - **`send` attribute** — force-send any record regardless of level via `"send", true`
 - **Retry with backoff** — retries on 5xx / timeout with exponential delay
@@ -38,12 +38,11 @@ func main() {
 
 	if os.Getenv("ENVIRONMENT") == "prod" {
 		alertHandler := sloggetalert.Option{
-			Level:       slog.LevelWarn,
-			Endpoint:    "https://api.getalert.ru/v1/events",
-			APIKey:      os.Getenv("GETALERT_API_KEY"),
-			Source:      "//my-service",
-			Type:        "log.record",
-			Environment: "production",
+			Level:    slog.LevelWarn,
+			Endpoint: "https://api.getalert.ru/v1/events",
+			APIKey:   os.Getenv("GETALERT_API_KEY"),
+			Source:   "//my-service",
+			AddEmoji: true,
 		}.NewHandler()
 		defer alertHandler.Close()
 
@@ -53,8 +52,8 @@ func main() {
 	log := slog.New(slogmulti.Fanout(logHandlers...))
 
 	log.Info("starts normally — not sent to getalert")
-	log.Warn("something is off", "component", "auth")    // → CloudEvent severity=warning
-	log.Error("connection lost", "err", "timeout")        // → CloudEvent severity=error
+	log.Warn("something is off", "component", "auth")    // → ⚠️ something is off
+	log.Error("connection lost", "err", "timeout")        // → 🔴 connection lost
 }
 ```
 
@@ -66,7 +65,7 @@ handler := sloggetalert.Option{
 	Endpoint: "https://api.getalert.ru/v1/events",
 	APIKey:   "ga_...",
 	Source:   "//my-app",
-	Type:     "log.record",
+	AddEmoji: true,
 }.NewHandler()
 defer handler.Close()
 
@@ -98,9 +97,10 @@ The `send` attribute is stripped from the CloudEvent data — it is a control fl
 | `Endpoint` | — | Full URL for event ingestion (e.g. `https://api.getalert.ru/v1/events`) |
 | `APIKey` | — | Bearer token for authentication |
 | `Source` | — | CloudEvent source (e.g. `"//my-service"`) |
-| `Type` | — | CloudEvent type (e.g. `"log.record"`) |
+| `Type` | `"log"` | CloudEvent type |
 | `Environment` | `"production"` | CloudEvent environment (`production`, `staging`, etc.) |
 | `AddSource` | `false` | Include caller file:line in `data.source_location` |
+| `AddEmoji` | `false` | Prepend severity emoji to subject (⚠️ warning, 🔴 error, ℹ️ info) |
 | `BufferSize` | `256` | Channel buffer size. Events are dropped when full |
 | `Timeout` | `5s` | HTTP request timeout |
 | `MaxRetries` | `2` | Retry attempts on 5xx / timeout |
@@ -115,13 +115,13 @@ Each slog record produces a CloudEvent:
   "specversion": "1.0",
   "id": "550e8400-e29b-41d4-a716-446655440000",
   "source": "//my-service",
-  "type": "log.record",
+  "type": "log",
+  "subject": "⚠️ something is off",
   "time": "2025-01-15T10:30:00Z",
   "datacontenttype": "application/json",
   "severity": "warning",
   "environment": "production",
   "data": {
-    "title": "something is off",
     "component": "auth"
   }
 }
@@ -129,7 +129,7 @@ Each slog record produces a CloudEvent:
 
 | slog | CloudEvent |
 |------|------------|
-| `record.Message` | `data.title` |
+| `record.Message` | `subject` (with emoji if `AddEmoji: true`) |
 | `slog.LevelWarn` | `severity: "warning"` |
 | `slog.LevelError` | `severity: "error"` |
 | `slog.LevelInfo` / `Debug` | `severity: "info"` |
@@ -144,7 +144,7 @@ slog.Warn("msg") → Handle() → channel → worker goroutine → POST JSON →
 
 1. `Enabled()` always returns `true` so `Handle()` can inspect per-record `send` attribute
 2. `Handle()` checks: level >= threshold **OR** `send: true` present — otherwise skips
-3. Builds a CloudEvent and pushes it into a buffered channel (non-blocking)
+3. Builds a CloudEvent (message → `subject`, attrs → `data`) and pushes it into a buffered channel (non-blocking)
 4. A background goroutine reads events and sends each as `POST` with JSON body
 5. On 5xx or timeout, retries with exponential backoff
 6. `Close()` drains the channel and flushes remaining events
