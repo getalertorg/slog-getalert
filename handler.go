@@ -305,7 +305,7 @@ func mapSeverity(level slog.Level) string {
 func severityEmoji(severity string) string {
 	switch severity {
 	case "error":
-		return "🔴"
+		return "🔥"
 	case "warning":
 		return "⚠️"
 	default:
